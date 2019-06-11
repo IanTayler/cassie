@@ -1,0 +1,6 @@
+build
+dist
+treiberman.egg-info
+*.swp
+Pipfile
+Pipfile.lock
