@@ -10,6 +10,8 @@
 #define INIT_BACKOFF_NANOSECS 8
 #define NANOSECONDS_IN_SECOND 1000000000
 
+static PyObject *PyErr_queue_Empty;
+
 typedef struct _backoff {
   long wait_time;
 } Backoff;
@@ -233,6 +235,16 @@ static PyObject *treiber_stack_push_method(TreiberStack *self, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *treiber_stack_put_method(TreiberStack *self, PyObject *args,
+                                          PyObject *kwds) {
+  static char *kwlist[] = {"item", "block", "timeout", NULL};
+  PyObject *v, *_ignored_block, *_ignored_timeout;
+  PyArg_ParseTupleAndKeywords(args, kwds, "O|OO", kwlist, &v, &_ignored_block,
+                              &_ignored_timeout);
+  treiber_stack_push(self, v);
+  Py_RETURN_NONE;
+}
+
 typedef struct _try_pop_ret {
   PyObject *obj;
   bool was_empty;
@@ -353,10 +365,38 @@ static PyObject *treiber_stack_pop_wait_method(TreiberStack *self,
   long timeout_ns = 0;
   if (timeout) {
     // Don't bother computing this if timeout is false.
-    timeout_ns = (int)(timeout_s * NANOSECONDS_IN_SECOND);
+    timeout_ns = (long)(timeout_s * NANOSECONDS_IN_SECOND);
   }
   TryPopRet retval = treiber_stack_pop_wait(self, timeout, timeout_ns);
   return try_pop_ret_to_py_pair(retval);
+}
+
+static PyObject *treiber_stack_get_method(TreiberStack *self, PyObject *args,
+                                          PyObject *kwds) {
+  static char *kwlist[] = {"block", "timeout", NULL};
+  bool block = true;
+  bool timeout;
+  long timeout_ns = 0;
+  PyObject *timeout_obj = Py_None;
+  PyArg_ParseTupleAndKeywords(args, kwds, "|bO", kwlist, &block, &timeout_obj);
+  TryPopRet retval;
+  if (timeout_obj == Py_None) {
+    timeout = false;
+  } else {
+    timeout = true;
+    double timeout_s = PyFloat_AsDouble(timeout_obj);
+    timeout_ns = (long)(timeout_s * NANOSECONDS_IN_SECOND);
+  }
+  if (block) {
+    retval = treiber_stack_pop_wait(self, timeout, timeout_ns);
+  } else {
+    retval = treiber_stack_try_pop(self);
+  }
+  if (retval.was_empty) {
+    PyErr_SetNone(PyErr_queue_Empty);
+    return NULL;
+  }
+  return retval.obj;
 }
 
 static PyMethodDef treibermodulemethods[] = {
@@ -371,7 +411,8 @@ static PyMethodDef treiberstackmethods[] = {
     {"pop_wait", (PyCFunction)treiber_stack_pop_wait_method, METH_VARARGS,
      "Pop, waiting if necessary. \n\nTakes a boolean timeout and a float "
      "timeout_time in seconds. Both are optional and default to False and "
-     "0.0, respectively. If timeout is set to True, timeout_time should be set "
+     "0.0, respectively. If timeout is set to True, timeout_time should be "
+     "set "
      "as well in almost all scenarios, though. If timeout is False, "
      "timeout_time is ignored."},
     {"pop", (PyCFunction)treiber_stack_pop_method, METH_NOARGS,
@@ -384,6 +425,12 @@ static PyMethodDef treiberstackmethods[] = {
      "stack was empty when we tried popping."},
     {"push", (PyCFunction)treiber_stack_push_method, METH_VARARGS,
      "Treiber stack thread-safe push."},
+    {"put", (PyCFunction)treiber_stack_put_method, METH_VARARGS | METH_KEYWORDS,
+     "See push. Ignores block and timeout parameters."},
+    {"get", (PyCFunction)treiber_stack_get_method, METH_VARARGS | METH_KEYWORDS,
+     "Like pop_wait if block is True, like pop otherwise. Raises queue.Empty "
+     "on timeout or if block=False and the queue is empty."},
+
     {NULL, NULL, 0, NULL},
 };
 
@@ -408,6 +455,14 @@ PyMODINIT_FUNC PyInit__treiber(void) {
   if (m == NULL) {
     return NULL;
   }
+
+  PyObject *queue_m = PyImport_ImportModule("queue");
+  if (!queue_m) {
+    return NULL;
+  }
+  PyObject *queue_m_dict = PyModule_GetDict(queue_m);
+  PyErr_queue_Empty = PyDict_GetItemString(queue_m_dict, "Empty");
+  Py_XDECREF(queue_m);
 
   Py_INCREF(&TreiberStackType);
   PyModule_AddObject(m, "TreiberStack", (PyObject *)&TreiberStackType);
