@@ -7,7 +7,11 @@ class TreiberStack(_treiber.TreiberStack):  # pylint: disable=c-extension-no-mem
 
     Works as a drop-in replacement of queue.SimpleQueue, which is the same
     as saying it's a queue.Queue except for the max_size init argument,
-    join and task_done."""
+    join and task_done.
+
+    It's implemented to be thread safe, even without the GIL, so as to be
+    used for other C extensions in cassie that may benefit from parallelism.
+    """
 
     def put_nowait(self, item):
         """In this implementation, equivalent to put(item)."""

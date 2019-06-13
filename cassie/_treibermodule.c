@@ -7,10 +7,16 @@
 #include <threads.h>
 #include <time.h>
 
-#define INIT_BACKOFF_NANOSECS 8
+#define INIT_BACKOFF_NANOSECS 16
 #define NANOSECONDS_IN_SECOND 1000000000
+#define INIT_NODE_POOL_CAP 32
+#define NODE_POOL_ENLARGE_MULTIPLIER 2
+#define NO_NEXT_NODE -1
 
-static PyObject *PyErr_queue_Empty;
+static PyObject *PyExc_queue_Empty;
+
+typedef long node_idx_t;
+typedef atomic_long atomic_node_idx_t;
 
 typedef struct _backoff {
   long wait_time;
@@ -32,50 +38,48 @@ static void backoff_wait(Backoff *backoff) {
 }
 
 typedef struct _treibernode {
-  struct _treibernode *next;
+  // next gets reused. It's either the index to the node pool for the next
+  // element in the stack or the index to the node pool for the next free node
+  // in our linked list of reusable node objects.
+  node_idx_t next;
   PyObject *value;
   atomic_long refcount;
 } TreiberNode;
 
-static TreiberNode *node_new(PyObject *v, TreiberNode *next) {
-  TreiberNode *node = malloc(sizeof *node);
-  if (!node) {
-    PyErr_NoMemory();
-  }
-  node->value = v;
-  node->next = next;
-  node->refcount = 1;
-  return node;
-}
-
-static void node_incref(TreiberNode *node) {
-  atomic_fetch_add(&node->refcount, 1);
-}
-
-static void node_xincref(TreiberNode *node) {
-  if (node) {
-    node_incref(node);
-  }
-}
-
-static void node_decref(TreiberNode *node) {
-  long old_value = atomic_fetch_sub(&node->refcount, 1);
-  if (old_value == 1) {
-    free(node);
-  }
-}
-
-static void node_xdecref(TreiberNode *node) {
-  if (node) {
-    node_decref(node);
-  }
-}
-
 typedef struct _treiberstack {
-  PyObject_HEAD _Atomic(TreiberNode *) head;
+  PyObject_HEAD atomic_node_idx_t head;
   mtx_t head_refcount_lock;
   sem_t sem;
+  TreiberNode *node_pool;
+  node_idx_t node_pool_head;
+  node_idx_t node_pool_cap;
 } TreiberStack;
+
+static void node_incref(TreiberStack *ts, node_idx_t node_idx) {
+  atomic_fetch_add(&ts->node_pool[node_idx].refcount, 1);
+}
+
+static void node_xincref(TreiberStack *ts, node_idx_t node_idx) {
+  if (node_idx != NO_NEXT_NODE) {
+    node_incref(ts, node_idx);
+  }
+}
+
+static void node_decref(TreiberStack *ts, node_idx_t node_idx) {
+  long old_value = atomic_fetch_sub(&ts->node_pool[node_idx].refcount, 1);
+  if (old_value == 1) {
+    // Add this node back to the linked list of free nodes.
+    // Repurpose the "next" field.
+    ts->node_pool[node_idx].next = ts->node_pool_head;
+    ts->node_pool_head = node_idx;
+  }
+}
+
+static void node_xdecref(TreiberStack *ts, node_idx_t node_idx) {
+  if (node_idx != NO_NEXT_NODE) {
+    node_decref(ts, node_idx);
+  }
+}
 
 // Acquire the stack's lock/mutex for node refcounts.
 static void treiber_stack_acquire_refcount_lock(TreiberStack *ts) {
@@ -91,6 +95,41 @@ static void treiber_stack_release_refcount_lock(TreiberStack *ts) {
   if (mtx_code != thrd_success) {
     PyErr_SetString(PyExc_RuntimeError, "mtx_unlock failed.");
   }
+}
+
+// node_new returns an index to the stack's node_pool for a new node in the
+// stack. The head_refcount_lock should be procured before calling node_new.
+static node_idx_t node_new(TreiberStack *ts, PyObject *v, node_idx_t next) {
+  node_idx_t node_idx = NO_NEXT_NODE;
+  // If the linked list of free nodes is empty, we realloc.
+  if (ts->node_pool_head == NO_NEXT_NODE) {
+    node_idx_t old_cap = ts->node_pool_cap;
+    ts->node_pool_cap *= NODE_POOL_ENLARGE_MULTIPLIER;
+    ts->node_pool =
+        realloc(ts->node_pool, (sizeof *ts->node_pool) * ts->node_pool_cap);
+    if (!ts->node_pool) {
+      PyErr_NoMemory();
+    }
+    node_idx = old_cap;
+    // Initialize the newly acquired nodes to serve as the linked list of free
+    // nodes.
+    ts->node_pool_head = old_cap + 1;
+    for (node_idx_t i = old_cap + 1; i < ts->node_pool_cap; i++) {
+      if (i == ts->node_pool_cap - 1) {
+        ts->node_pool[i].next = NO_NEXT_NODE;
+      } else {
+        ts->node_pool[i].next = i + 1;
+      }
+    }
+  } else {
+    // If the linked list of free nodes isn't empty, just get the first one.
+    node_idx = ts->node_pool_head;
+    ts->node_pool_head = ts->node_pool[node_idx].next;
+  }
+  ts->node_pool[node_idx].refcount = 1;
+  ts->node_pool[node_idx].value = v;
+  ts->node_pool[node_idx].next = next;
+  return node_idx;
 }
 
 // Vacate/release the stack's semaphore. Return true if successful.
@@ -171,13 +210,26 @@ static PyObject *treiber_stack_new(PyTypeObject *type, PyObject *args,
   TreiberStack *self;
   self = (TreiberStack *)type->tp_alloc(type, 0);
   if (self != NULL) {
+    self->head = NO_NEXT_NODE;
+    self->node_pool_cap = INIT_NODE_POOL_CAP;
+    self->node_pool = calloc(self->node_pool_cap, sizeof *self->node_pool);
+    self->node_pool_head = 0;
+    for (int i = 0; i < self->node_pool_cap; i++) {
+      // The last node in the linked list points signals NO_NEXT_NODE. All
+      // others signal the next node.
+      if (i == self->node_pool_cap - 1) {
+        self->node_pool[i].next = NO_NEXT_NODE;
+      } else {
+        self->node_pool[i].next = i + 1;
+      }
+    }
     int mtx_code = mtx_init(&self->head_refcount_lock, mtx_plain);
     if (mtx_code != thrd_success) {
       PyErr_SetString(PyExc_RuntimeError, "mtx_init for TreiberStack failed.");
       return NULL;
     }
-    // Arguments set the semaphore as process-internal and set its initial value
-    // to 0.
+    // Arguments set the semaphore as process-internal and set its initial
+    // value to 0.
     int sem_code = sem_init(&self->sem, 0, 0);
     if (sem_code != 0) {
       PyErr_SetString(PyExc_RuntimeError, "sem_init for TreiberStack failed.");
@@ -188,42 +240,39 @@ static PyObject *treiber_stack_new(PyTypeObject *type, PyObject *args,
 }
 
 static void treiber_stack_dealloc(TreiberStack *self) {
-  TreiberNode *curr_node = self->head;
-  while (curr_node) {
-    TreiberNode *next_node = curr_node->next;
-    PyObject *value_tmp = curr_node->value;
-    free(curr_node);
-    Py_XDECREF(value_tmp);
-    curr_node = next_node;
-  }
+  free(self->node_pool);
   mtx_destroy(&self->head_refcount_lock);
   sem_destroy(&self->sem);
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-static void treiber_stack_push(TreiberStack *ts, PyObject *v) {
-  Py_INCREF(v);
+void treiber_stack_push(TreiberStack *ts, PyObject *v) {
   Backoff backoff = backoff_init(INIT_BACKOFF_NANOSECS);
   treiber_stack_acquire_refcount_lock(ts);
-  TreiberNode *current_head = ts->head;
-  node_xincref(current_head);
+  node_idx_t current_head_pos = ts->head;
+  node_idx_t old_head_pos = current_head_pos;
+  node_xincref(ts, current_head_pos);
+  node_idx_t new_head_pos = node_new(ts, v, current_head_pos);
   treiber_stack_release_refcount_lock(ts);
-  TreiberNode *new_head = node_new(v, current_head);
-  // Atomicity here may not be strictly necessary, as C code in extensions
-  // should run atomically under normal circumstances.
-  // But this gives us stronger guarantees in cases where some other C
-  // extension released the GIL or other weird stuff is going on.
-  while (!atomic_compare_exchange_weak(&ts->head, &current_head, new_head)) {
+  // The stack is implemented using CAS even if it's unnecessary for its  direct
+  // usage in Python (due to the GIL). The idea is for the stack to be usable as
+  // a building block for other C extensions that may want to release the GIL.
+  while (!atomic_compare_exchange_weak(&ts->head, &current_head_pos,
+                                       new_head_pos)) {
+    // Here current_head_pos was updated to have the actual head value.
     backoff_wait(&backoff);
     treiber_stack_acquire_refcount_lock(ts);
-    node_xdecref(current_head);
-    current_head = ts->head;
-    node_xincref(current_head);
+    node_xdecref(ts, old_head_pos);
+    // Update current_head_pos even though CAS already updated it because it's
+    // likely to have changed again after the backoff.
+    current_head_pos = ts->head;
+    old_head_pos = current_head_pos;
+    node_xincref(ts, current_head_pos);
+    ts->node_pool[new_head_pos].next = current_head_pos;
     treiber_stack_release_refcount_lock(ts);
-    new_head->next = current_head;
   }
   treiber_stack_acquire_refcount_lock(ts);
-  node_xdecref(current_head);
+  node_xdecref(ts, current_head_pos);
   treiber_stack_release_refcount_lock(ts);
   treiber_stack_sem_post(ts);
 }
@@ -231,6 +280,7 @@ static void treiber_stack_push(TreiberStack *ts, PyObject *v) {
 static PyObject *treiber_stack_push_method(TreiberStack *self, PyObject *args) {
   PyObject *v;
   PyArg_ParseTuple(args, "O", &v);
+  Py_INCREF(v);
   treiber_stack_push(self, v);
   Py_RETURN_NONE;
 }
@@ -241,6 +291,7 @@ static PyObject *treiber_stack_put_method(TreiberStack *self, PyObject *args,
   PyObject *v, *_ignored_block, *_ignored_timeout;
   PyArg_ParseTupleAndKeywords(args, kwds, "O|OO", kwlist, &v, &_ignored_block,
                               &_ignored_timeout);
+  Py_INCREF(v);
   treiber_stack_push(self, v);
   Py_RETURN_NONE;
 }
@@ -250,7 +301,7 @@ typedef struct _try_pop_ret {
   bool was_empty;
 } TryPopRet;
 
-static PyObject *try_pop_ret_to_py_pair(TryPopRet retval) {
+PyObject *try_pop_ret_to_py_pair(TryPopRet retval) {
   PyObject *was_empty_obj;
   if (retval.was_empty) {
     was_empty_obj = Py_True;
@@ -269,31 +320,33 @@ static PyObject *try_pop_ret_to_py_pair(TryPopRet retval) {
 //
 // Do not use by itself as it doesn't procure/acquire the semaphore!
 static TryPopRet treiber_stack_single_pop(TreiberStack *ts) {
-  TreiberNode *old_head = ts->head;
-  if (!old_head) {
+  node_idx_t old_head_pos = ts->head;
+  if (old_head_pos == NO_NEXT_NODE) {
     // This shouldn't happen, it's an error.
     // single_pop should not be called without successfully procuring the
-    // semaphore before and in that case old_head should never be NULL.
+    // semaphore before and in that case old_head_pos should never be
+    // NO_NEXT_NODE.
     PyErr_SetString(PyExc_RuntimeError,
-                    "got a null head in single_pop. Probably an error in the "
+                    "got an empty head in single_pop. Probably an error in the "
                     "implementation of the _treiber C extension.");
     TryPopRet ret = {NULL, true};
     return ret;
   }
-  TreiberNode *next_head = old_head->next;
-  if (!atomic_compare_exchange_strong(&ts->head, &old_head, next_head)) {
+  node_idx_t next_head_pos = ts->node_pool[old_head_pos].next;
+  if (!atomic_compare_exchange_strong(&ts->head, &old_head_pos,
+                                      next_head_pos)) {
     TryPopRet ret = {NULL, false};
     return ret;
   }
-  PyObject *return_object = old_head->value;
   treiber_stack_acquire_refcount_lock(ts);
-  node_xdecref(old_head);
+  PyObject *return_object = ts->node_pool[old_head_pos].value;
+  node_xdecref(ts, old_head_pos);
   treiber_stack_release_refcount_lock(ts);
   TryPopRet ret = {return_object, false};
   return ret;
 }
 
-static TryPopRet treiber_stack_try_pop(TreiberStack *ts) {
+TryPopRet treiber_stack_try_pop(TreiberStack *ts) {
   bool procured_sem = treiber_stack_sem_trywait(ts);
   if (!procured_sem) {
     TryPopRet ret = {NULL, true};
@@ -315,7 +368,7 @@ static PyObject *treiber_stack_try_pop_method(TreiberStack *self,
 
 // Pop an item from the stack, retrying if popping fails and the stack is not
 // empty.
-static TryPopRet treiber_stack_pop(TreiberStack *ts) {
+TryPopRet treiber_stack_pop(TreiberStack *ts) {
   bool procured_sem = treiber_stack_sem_trywait(ts);
   if (!procured_sem) {
     TryPopRet ret = {NULL, true};
@@ -336,8 +389,8 @@ static PyObject *treiber_stack_pop_method(TreiberStack *self,
   return try_pop_ret_to_py_pair(retval);
 }
 
-static TryPopRet treiber_stack_pop_wait(TreiberStack *ts, bool timeout,
-                                        long timeout_ns) {
+TryPopRet treiber_stack_pop_wait(TreiberStack *ts, bool timeout,
+                                 long timeout_ns) {
   bool procured_sem;
   if (timeout) {
     procured_sem = treiber_stack_sem_timedwait(ts, timeout_ns);
@@ -376,7 +429,7 @@ static PyObject *treiber_stack_get_method(TreiberStack *self, PyObject *args,
   static char *kwlist[] = {"block", "timeout", NULL};
   bool block = true;
   bool timeout;
-  long timeout_ns = 0;
+  long timeout_ns = 1;
   PyObject *timeout_obj = Py_None;
   PyArg_ParseTupleAndKeywords(args, kwds, "|bO", kwlist, &block, &timeout_obj);
   TryPopRet retval;
@@ -393,7 +446,7 @@ static PyObject *treiber_stack_get_method(TreiberStack *self, PyObject *args,
     retval = treiber_stack_try_pop(self);
   }
   if (retval.was_empty) {
-    PyErr_SetNone(PyErr_queue_Empty);
+    PyErr_SetNone(PyExc_queue_Empty);
     return NULL;
   }
   return retval.obj;
@@ -461,7 +514,7 @@ PyMODINIT_FUNC PyInit__treiber(void) {
     return NULL;
   }
   PyObject *queue_m_dict = PyModule_GetDict(queue_m);
-  PyErr_queue_Empty = PyDict_GetItemString(queue_m_dict, "Empty");
+  PyExc_queue_Empty = PyDict_GetItemString(queue_m_dict, "Empty");
   Py_XDECREF(queue_m);
 
   Py_INCREF(&TreiberStackType);

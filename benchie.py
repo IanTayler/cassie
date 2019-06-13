@@ -5,15 +5,16 @@ import timeit
 from cassie import TreiberStack
 
 
-def bench(queuelike, thread_n, reps):
+def bench(queueclass, thread_n, elem_n):
+    queuelike = queueclass()
     threads = []
 
     def producer():
-        for i in range(reps):
+        for i in range(elem_n):
             queuelike.put(i)
 
     def consumer():
-        for _ in range(reps):
+        for _ in range(elem_n):
             queuelike.get()
 
     for _ in range(thread_n):
@@ -25,9 +26,9 @@ def bench(queuelike, thread_n, reps):
         th.join()
 
 
-num_reps = 500
+num_reps = 100
 num_threads = 10
-elems_per_thread = 500
+elems_per_thread = 247
 
 
 def measure_queue_us(q):
@@ -41,14 +42,10 @@ def measure_queue_us(q):
 def run_benchmark(q):
     print(
         "{}: {}us per repetition for {} threads, {} elems per thread. Repeated {} times.".format(
-            type(q).__name__,
-            measure_queue_us(q),
-            num_threads,
-            elems_per_thread,
-            num_reps,
+            q.__name__, measure_queue_us(q), num_threads, elems_per_thread, num_reps
         )
     )
 
 
-for q in [TreiberStack(), SimpleQueue(), Queue()]:
+for q in [TreiberStack, SimpleQueue, Queue]:
     run_benchmark(q)
