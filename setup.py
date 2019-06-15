@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="cassie",
-    version="0.0.1",
+    version="0.1.0",
     description="Concurrency utilities for python.",
     ext_modules=[setuptools.Extension("_treiber", ["cassie/_treibermodule.c"])],
     packages=setuptools.find_packages(),
