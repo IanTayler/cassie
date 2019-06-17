@@ -1,6 +1,6 @@
 build
 dist
-treiberman.egg-info
+cassie.egg-info
 *.swp
 Pipfile
 Pipfile.lock
