@@ -1,10 +1,10 @@
 #include <Python.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <threads.h>
 #include <time.h>
 
 #define INIT_BACKOFF_NANOSECS 16
@@ -48,7 +48,7 @@ typedef struct _treibernode {
 
 typedef struct _treiberstack {
   PyObject_HEAD atomic_node_idx_t head;
-  mtx_t head_refcount_lock;
+  pthread_mutex_t head_refcount_lock;
   sem_t sem;
   TreiberNode *node_pool;
   node_idx_t node_pool_head;
@@ -83,17 +83,17 @@ static void node_xdecref(TreiberStack *ts, node_idx_t node_idx) {
 
 // Acquire the stack's lock/mutex for node refcounts.
 static void treiber_stack_acquire_refcount_lock(TreiberStack *ts) {
-  int mtx_code = mtx_lock(&ts->head_refcount_lock);
-  if (mtx_code != thrd_success) {
-    PyErr_SetString(PyExc_RuntimeError, "mtx_lock failed.");
+  int mtx_code = pthread_mutex_lock(&ts->head_refcount_lock);
+  if (mtx_code != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "pthread_mutex_lock failed.");
   }
 }
 
 // Release the stack's lock/mutex for node refcounts.
 static void treiber_stack_release_refcount_lock(TreiberStack *ts) {
-  int mtx_code = mtx_unlock(&ts->head_refcount_lock);
-  if (mtx_code != thrd_success) {
-    PyErr_SetString(PyExc_RuntimeError, "mtx_unlock failed.");
+  int mtx_code = pthread_mutex_unlock(&ts->head_refcount_lock);
+  if (mtx_code != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "pthread_mutex_unlock failed.");
   }
 }
 
@@ -223,8 +223,8 @@ static PyObject *treiber_stack_new(PyTypeObject *type, PyObject *args,
         self->node_pool[i].next = i + 1;
       }
     }
-    int mtx_code = mtx_init(&self->head_refcount_lock, mtx_plain);
-    if (mtx_code != thrd_success) {
+    int mtx_code = pthread_mutex_init(&self->head_refcount_lock, NULL);
+    if (mtx_code != 0) {
       PyErr_SetString(PyExc_RuntimeError, "mtx_init for TreiberStack failed.");
       return NULL;
     }
@@ -241,7 +241,7 @@ static PyObject *treiber_stack_new(PyTypeObject *type, PyObject *args,
 
 static void treiber_stack_dealloc(TreiberStack *self) {
   free(self->node_pool);
-  mtx_destroy(&self->head_refcount_lock);
+  pthread_mutex_destroy(&self->head_refcount_lock);
   sem_destroy(&self->sem);
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
