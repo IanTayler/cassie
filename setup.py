@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="cassie",
-    version="0.1.0",
+    version="0.1.1",
     license="MIT License",
     author="Ian Tayler",
     author_email="iangtayler@gmail.com",
